@@ -100,7 +100,6 @@ def get_sample_passages() -> Dict[str, str]:
 def main():
     st.set_page_config(
         page_title="Integrated Background Editor",
-        page_icon="✍️",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -171,7 +170,7 @@ def main():
     models = load_all_models()
 
     # Sidebar Parameters
-    st.sidebar.header("⚙️ Editor Settings")
+    st.sidebar.header("Editor Settings")
     mode = st.sidebar.radio(
         "Select Operation Mode:",
         ["Simulated Fast Typing", "Interactive Live Typing", "Speed Demon Benchmark"],
@@ -202,19 +201,19 @@ def main():
         col1, col2 = st.columns([1.1, 0.9])
 
         with col1:
-            st.subheader("📝 Input Passage")
+            st.subheader("Input Passage")
             sample_options = get_sample_passages()
             selected_sample = st.selectbox("Choose a sample passage or enter your own:", list(sample_options.keys()))
             input_text = st.text_area("Passage Text:", value=sample_options[selected_sample], height=130)
 
             col_btn, col_spd = st.columns([1, 1])
             with col_btn:
-                start_btn = st.button("🚀 Start Typing Simulation", type="primary", use_container_width=True)
+                start_btn = st.button("Start Typing Simulation", type="primary", use_container_width=True)
             with col_spd:
                 typing_delay = st.slider("Typing Delay (seconds/token):", 0.0, 0.3, 0.05, 0.01)
 
         with col2:
-            st.subheader("🔔 Live Alert Feed")
+            st.subheader("Live Alert Feed")
             alerts_container = st.container(height=380)
 
         # Simulation Run
@@ -233,7 +232,7 @@ def main():
             stream_tokens = simulate_fast_typing_merges(input_text, p=merge_p, seed=42)
 
             st.write("---")
-            st.subheader("⌨️ Simulated Incoming Stream")
+            st.subheader("Simulated Incoming Stream")
             stream_display = st.empty()
 
             displayed_stream: List[str] = []
@@ -266,7 +265,7 @@ def main():
                 if typing_delay > 0:
                     time.sleep(typing_delay)
 
-            st.success("✅ Typing simulation completed!")
+            st.success("Typing simulation completed!")
 
             # Latency and Statistics
             stats = engine.get_latency_stats()
@@ -278,7 +277,7 @@ def main():
 
             # Final Passage Analysis
             st.write("---")
-            st.subheader("📊 Part 4: End-of-Passage Comparative Analysis")
+            st.subheader("Part 4: End-of-Passage Comparative Analysis")
             with st.spinner("Parsing sentences with PCFG Constituency and N-Gram models..."):
                 analysis_rows = analyze_final_passage(
                     engine.accumulated_tokens,
@@ -309,7 +308,7 @@ def main():
             st.dataframe(df_summary, use_container_width=True)
 
             # PCFG Tree Display
-            with st.expander("🌳 View PCFG Constituency Parse Trees"):
+            with st.expander("View PCFG Constituency Parse Trees"):
                 for r in analysis_rows:
                     st.markdown(f"**Sentence {r['sentence_idx']}:** {r['sentence_text']}")
                     if r["pcfg_tree"] is not None:
@@ -321,7 +320,7 @@ def main():
     # MODE 2: INTERACTIVE LIVE TYPING
     # -------------------------------------------------------------
     elif mode == "Interactive Live Typing":
-        st.subheader("⌨️ Real-Time Interactive Editor")
+        st.subheader("Real-Time Interactive Editor")
         st.write("Type or paste any text below. The background engine will process it incrementally.")
 
         user_text = st.text_area(
@@ -370,14 +369,14 @@ def main():
 
             stats = engine.get_latency_stats()
             st.caption(
-                f"⚡ Avg token latency: **{stats['avg_token_latency_ms']:.2f} ms** | Avg grammar latency: **{stats['avg_grammar_latency_ms']:.2f} ms**"
+                f"Avg token latency: **{stats['avg_token_latency_ms']:.2f} ms** | Avg grammar latency: **{stats['avg_grammar_latency_ms']:.2f} ms**"
             )
 
     # -------------------------------------------------------------
     # MODE 3: SPEED DEMON BENCHMARK
     # -------------------------------------------------------------
     elif mode == "Speed Demon Benchmark":
-        st.subheader("⚡ Part 5: Speed Demon Benchmark (1,000 Words)")
+        st.subheader("Part 5: Speed Demon Benchmark (1,000 Words)")
         st.write(
             "Benchmarks the latency difference between the per-token layer (Segmentation + Spelling) "
             "and the grammar-trigger layer on exactly 1,000 simulated words."
