@@ -1,16 +1,12 @@
-"""Morphology-Aware Hidden Markov Model (HMM) Part-of-Speech Tagger with Viterbi Decoding."""
+"""Morphology-Aware Trigram HMM Part-of-Speech Tagger with Viterbi Decoding."""
 
 import math
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 
 def extract_morphological_features(word: str) -> List[str]:
-    """Extracts morphological and orthographic features from a word.
-
-    Features include suffixes (lengths 1-4), prefixes (lengths 2-3),
-    and shape properties (capitalization, digits, hyphens).
-    """
+    """Extract morphological and orthographic features from a word."""
     features: List[str] = []
     w_lower = word.lower()
     w_len = len(word)
@@ -25,11 +21,13 @@ def extract_morphological_features(word: str) -> List[str]:
         if w_len > plen + 1:
             features.append(f"pref_{w_lower[:plen]}")
 
-    # Orthographic / Shape features
+    # Shape features
     if any(c.isdigit() for c in word):
         features.append("shape_has_digit")
+
     if "-" in word:
         features.append("shape_has_hyphen")
+
     if word.isupper() and w_len > 1:
         features.append("shape_all_caps")
     elif word[0].isupper() and (w_len == 1 or word[1:].islower()):
@@ -57,21 +55,22 @@ class MorphologyModel:
         self.beta = beta
 
     def log_prob(self, word: str, tag: str) -> float:
-        """Computes log P(morphology(word) | tag) with smoothed naive bayes."""
+        """Compute log P(morphology(word) | tag)."""
         features = extract_morphological_features(word)
+
         if not features:
             return -10.0
 
         total_f_for_tag = self.tag_feature_totals.get(tag, 0)
         denom = total_f_for_tag + self.beta * self.vocab_f_size
+
         log_prob = 0.0
 
-        for f in features:
-            c = self.feature_tag_counts[f][tag] if f in self.feature_tag_counts else 0
-            p = (c + self.beta) / denom
-            log_prob += math.log(p)
+        for feature in features:
+            count = self.feature_tag_counts[feature].get(tag, 0)
+            probability = (count + self.beta) / denom
+            log_prob += math.log(probability)
 
-        # Normalize by feature length to prevent over-penalizing words with many features
         return log_prob / math.sqrt(len(features))
 
 
@@ -80,36 +79,45 @@ def train_pos_tagger(
     alpha: float = 0.1,
     rare_threshold: int = 5,
 ) -> Dict[str, Any]:
-    """Trains emission and transition probabilities for POS tagging with morphology awareness.
+    """Train a morphology-aware trigram POS HMM.
 
-    Args:
-        corpus: Training sentences, where each sentence is a list of (word, tag) tuples.
-        alpha: Smoothing parameter for transition probabilities.
-        rare_threshold: Words with frequency <= rare_threshold are used to train the morphology model.
+    Transition probability:
 
-    Returns:
-        A dictionary containing all tagger model components:
-        'tags', 'transitions', 'emissions', 'tag_counts', 'morphology_model',
-        'word_vocab', 'start_transitions', 'end_transitions'.
+        P(tag_i | tag_i-2, tag_i-1)
     """
+
     tag_counts: Counter = Counter()
     word_counts: Counter = Counter()
+
     word_tag_counts: Dict[str, Counter] = defaultdict(Counter)
     tag_word_counts: Dict[str, Counter] = defaultdict(Counter)
 
-    transition_counts: Dict[str, Counter] = defaultdict(Counter)
+    # Context = (previous_previous_tag, previous_tag)
+    # Value = counts of possible current tags.
+    transition_counts: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+
     start_counts: Counter = Counter()
     end_counts: Counter = Counter()
 
     tags: Set[str] = set()
+    num_sentences = 0
+
+    # ---------------------------------------------------------
+    # Collect corpus counts
+    # ---------------------------------------------------------
 
     for sentence in corpus:
         if not sentence:
             continue
 
+        num_sentences += 1
+
+        prev_prev_tag = "<s>"
         prev_tag = "<s>"
+
         for i, (word, tag) in enumerate(sentence):
             tags.add(tag)
+
             tag_counts[tag] += 1
             word_counts[word.lower()] += 1
             word_tag_counts[word.lower()][tag] += 1
@@ -117,32 +125,41 @@ def train_pos_tagger(
 
             if i == 0:
                 start_counts[tag] += 1
-            else:
-                transition_counts[prev_tag][tag] += 1
+
+            # Required trigram transition:
+            # P(current_tag | previous_two_tags)
+            transition_counts[(prev_prev_tag, prev_tag)][tag] += 1
+
+            prev_prev_tag = prev_tag
             prev_tag = tag
 
         end_counts[prev_tag] += 1
 
-    tag_list = sorted(list(tags))
+    tag_list = sorted(tags)
     num_tags = len(tag_list)
-    num_sentences = max(len(corpus), 1)
+    num_sentences = max(num_sentences, 1)
 
-    # Train Morphology Model using rare & all words
+    # ---------------------------------------------------------
+    # Morphology model
+    # ---------------------------------------------------------
+
     feature_tag_counts: Dict[str, Counter] = defaultdict(Counter)
     tag_feature_totals: Counter = Counter()
     all_features: Set[str] = set()
 
     for sentence in corpus:
         for word, tag in sentence:
-            # Emphasize rare words for morphology model, but also include common words
-            w_count = word_counts[word.lower()]
-            weight = 3 if w_count <= rare_threshold else 1
+            count = word_counts[word.lower()]
 
-            feats = extract_morphological_features(word)
-            for f in feats:
-                feature_tag_counts[f][tag] += weight
+            # Give rare words more influence.
+            weight = 3 if count <= rare_threshold else 1
+
+            features = extract_morphological_features(word)
+
+            for feature in features:
+                feature_tag_counts[feature][tag] += weight
                 tag_feature_totals[tag] += weight
-                all_features.add(f)
+                all_features.add(feature)
 
     morph_model = MorphologyModel(
         feature_tag_counts=feature_tag_counts,
@@ -150,42 +167,85 @@ def train_pos_tagger(
         all_features=all_features,
     )
 
-    # Precompute smoothed transition log-probabilities
-    # log P(tag_j | tag_i)
-    transitions: Dict[Tuple[str, str], float] = {}
-    for t_prev in tag_list:
-        denom = tag_counts[t_prev] + alpha * num_tags
-        for t_curr in tag_list:
-            c = transition_counts[t_prev][t_curr]
-            prob = (c + alpha) / denom
-            transitions[(t_prev, t_curr)] = math.log(prob)
+    # ---------------------------------------------------------
+    # Store trigram transition probabilities.
+    #
+    # Only observed contexts are stored.
+    # ---------------------------------------------------------
 
-    # Start transitions log P(t | <s>)
+    transitions: Dict[Tuple[str, str, str], float] = {}
+
+    for context, next_counts in transition_counts.items():
+        context_total = sum(next_counts.values())
+
+        denominator = context_total + alpha * num_tags
+
+        prev_prev_tag, prev_tag = context
+
+        for current_tag, count in next_counts.items():
+            probability = (count + alpha) / denominator
+
+            transitions[
+                (prev_prev_tag, prev_tag, current_tag)
+            ] = math.log(probability)
+
+    # Log probability for an unseen transition.
+    unseen_transition_log_prob = math.log(
+        alpha / (alpha * num_tags)
+    )
+
+    # ---------------------------------------------------------
+    # Start probabilities
+    # ---------------------------------------------------------
+
     start_transitions: Dict[str, float] = {}
-    start_denom = num_sentences + alpha * num_tags
-    for t in tag_list:
-        c = start_counts[t]
-        start_transitions[t] = math.log((c + alpha) / start_denom)
 
-    # End transitions log P(</s> | t)
-    end_transitions: Dict[str, float] = {}
-    for t in tag_list:
-        denom = tag_counts[t] + alpha * 2
-        c = end_counts[t]
-        end_transitions[t] = math.log((c + alpha) / denom)
+    start_denominator = num_sentences + alpha * num_tags
 
-    # Precompute lexical emission log-probabilities for known words: log P(w | t)
-    # P(w | t) = C(t, w) / C(t)
-    emissions: Dict[Tuple[str, str], float] = {}
     for tag in tag_list:
-        c_tag = tag_counts[tag]
-        if c_tag > 0:
-            for w, c_tw in tag_word_counts[tag].items():
-                emissions[(w, tag)] = math.log(c_tw / c_tag)
+        count = start_counts[tag]
+
+        start_transitions[tag] = math.log(
+            (count + alpha) / start_denominator
+        )
+
+    # ---------------------------------------------------------
+    # End probabilities
+    # ---------------------------------------------------------
+
+    end_transitions: Dict[str, float] = {}
+
+    for tag in tag_list:
+        denominator = tag_counts[tag] + alpha * 2
+        count = end_counts[tag]
+
+        end_transitions[tag] = math.log(
+            (count + alpha) / denominator
+        )
+
+    # ---------------------------------------------------------
+    # Lexical emissions
+    #
+    # P(word | tag)
+    # ---------------------------------------------------------
+
+    emissions: Dict[Tuple[str, str], float] = {}
+
+    for tag in tag_list:
+        tag_total = tag_counts[tag]
+
+        if tag_total == 0:
+            continue
+
+        for word, count in tag_word_counts[tag].items():
+            emissions[(word, tag)] = math.log(
+                count / tag_total
+            )
 
     return {
         "tags": tag_list,
         "transitions": transitions,
+        "unseen_transition_log_prob": unseen_transition_log_prob,
         "start_transitions": start_transitions,
         "end_transitions": end_transitions,
         "emissions": emissions,
@@ -198,96 +258,345 @@ def train_pos_tagger(
 def viterbi_pos_tagging(
     words: List[str],
     tagger_model: Dict[str, Any],
+    beam_width: int = 40,
 ) -> List[Tuple[str, str]]:
-    """Tags a sequence of words using Viterbi decoding and trained emission/transition probabilities.
+    """Tag a sentence using trigram-HMM Viterbi decoding.
 
-    Args:
-        words: List of word strings to tag.
-        tagger_model: Model dictionary returned by train_pos_tagger.
+    The model uses:
 
-    Returns:
-        List of (word, predicted_tag) tuples.
+        P(tag_i | tag_i-2, tag_i-1)
+
+    Beam pruning is used to keep the computation practical for
+    corpora with very large POS tagsets such as the Brown corpus.
     """
+
     if not words:
         return []
 
     tags: List[str] = tagger_model["tags"]
-    transitions: Dict[Tuple[str, str], float] = tagger_model["transitions"]
-    start_transitions: Dict[str, float] = tagger_model["start_transitions"]
-    end_transitions: Dict[str, float] = tagger_model["end_transitions"]
-    emissions: Dict[Tuple[str, str], float] = tagger_model["emissions"]
-    morph_model: MorphologyModel = tagger_model["morphology_model"]
-    word_vocab: Set[str] = tagger_model["word_vocab"]
+
+    transitions: Dict[Tuple[str, str, str], float] = (
+        tagger_model["transitions"]
+    )
+
+    unseen_transition_log_prob: float = tagger_model.get(
+        "unseen_transition_log_prob",
+        -25.0,
+    )
+
+    start_transitions: Dict[str, float] = (
+        tagger_model["start_transitions"]
+    )
+
+    end_transitions: Dict[str, float] = (
+        tagger_model["end_transitions"]
+    )
+
+    emissions: Dict[Tuple[str, str], float] = (
+        tagger_model["emissions"]
+    )
+
+    morph_model: MorphologyModel = (
+        tagger_model["morphology_model"]
+    )
+
+    word_vocab: Set[str] = (
+        tagger_model["word_vocab"]
+    )
 
     n = len(words)
 
-    # Helper to calculate log P(word | tag)
-    def get_emission_log_prob(w: str, t: str) -> float:
-        w_lower = w.lower()
-        if w_lower in word_vocab:
-            # Known word
-            pair = (w_lower, t)
+    # ---------------------------------------------------------
+    # Emission probability helper
+    # ---------------------------------------------------------
+
+    def get_emission_log_prob(
+        word: str,
+        tag: str,
+    ) -> float:
+
+        word_lower = word.lower()
+
+        # Known word
+        if word_lower in word_vocab:
+
+            pair = (word_lower, tag)
+
             if pair in emissions:
-                # Small interpolation with morphology for robustness
                 return emissions[pair]
-            else:
-                # Word was seen, but never with this tag
-                return -25.0
-        else:
-            # Out of vocabulary: use morphology model
-            return morph_model.log_prob(w, t)
 
-    # Viterbi tables
-    # viterbi[i][t] = best log probability ending at step i with tag t
-    # backpointer[i][t] = previous tag that achieved this max
-    viterbi: List[Dict[str, float]] = [{} for _ in range(n)]
-    backpointer: List[Dict[str, str]] = [{} for _ in range(n)]
+            # Seen word but never with this tag.
+            return -25.0
 
-    # Step 0: Initialization
-    w0 = words[0]
-    for t in tags:
-        start_p = start_transitions.get(t, -20.0)
-        emit_p = get_emission_log_prob(w0, t)
-        viterbi[0][t] = start_p + emit_p
+        # Unknown word: use morphology.
+        return morph_model.log_prob(word, tag)
 
-    # Steps 1 to n-1: Recursion
-    for i in range(1, n):
-        wi = words[i]
-        for t_curr in tags:
-            emit_p = get_emission_log_prob(wi, t_curr)
-            best_prev_score = -float("inf")
-            best_prev_tag = tags[0]
+    # ---------------------------------------------------------
+    # One-word sentence
+    # ---------------------------------------------------------
 
-            for t_prev in tags:
-                trans_p = transitions.get((t_prev, t_curr), -25.0)
-                score = viterbi[i - 1][t_prev] + trans_p
-                if score > best_prev_score:
-                    best_prev_score = score
-                    best_prev_tag = t_prev
+    if n == 1:
 
-            viterbi[i][t_curr] = best_prev_score + emit_p
-            backpointer[i][t_curr] = best_prev_tag
+        best_tag = max(
+            tags,
+            key=lambda tag:
+                start_transitions.get(tag, -20.0)
+                + get_emission_log_prob(
+                    words[0],
+                    tag,
+                )
+                + end_transitions.get(
+                    tag,
+                    -20.0,
+                ),
+        )
 
-    # Termination: step n with </s>
+        return [(words[0], best_tag)]
+
+    # ---------------------------------------------------------
+    # Viterbi state
+    #
+    # State:
+    #
+    #     (previous_tag, current_tag)
+    #
+    # This stores the previous TWO tags.
+    # ---------------------------------------------------------
+
+    viterbi: List[
+        Dict[Tuple[str, str], float]
+    ] = [{} for _ in range(n)]
+
+    backpointer: List[
+        Dict[Tuple[str, str], Tuple[str, str]]
+    ] = [{} for _ in range(n)]
+
+    # ---------------------------------------------------------
+    # First word
+    # ---------------------------------------------------------
+
+    for tag in tags:
+
+        score = (
+            start_transitions.get(
+                tag,
+                -20.0,
+            )
+            + get_emission_log_prob(
+                words[0],
+                tag,
+            )
+        )
+
+        viterbi[0][("<s>", tag)] = score
+
+    # ---------------------------------------------------------
+    # Second word
+    # ---------------------------------------------------------
+
+    second_candidates: List[
+        Tuple[float, Tuple[str, str], Tuple[str, str]]
+    ] = []
+
+    for previous_tag in tags:
+
+        previous_score = viterbi[0][
+            ("<s>", previous_tag)
+        ]
+
+        for current_tag in tags:
+
+            transition = transitions.get(
+                (
+                    "<s>",
+                    previous_tag,
+                    current_tag,
+                ),
+                unseen_transition_log_prob,
+            )
+
+            score = (
+                previous_score
+                + transition
+                + get_emission_log_prob(
+                    words[1],
+                    current_tag,
+                )
+            )
+
+            state = (
+                previous_tag,
+                current_tag,
+            )
+
+            second_candidates.append(
+                (
+                    score,
+                    state,
+                    (
+                        "<s>",
+                        previous_tag,
+                    ),
+                )
+            )
+
+    # Keep only best states.
+    second_candidates.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    for score, state, previous_state in second_candidates[
+        :beam_width
+    ]:
+        viterbi[1][state] = score
+        backpointer[1][state] = previous_state
+
+    # ---------------------------------------------------------
+    # Remaining words
+    # ---------------------------------------------------------
+
+    for i in range(2, n):
+
+        word = words[i]
+
+        candidates: List[
+            Tuple[float, Tuple[str, str], Tuple[str, str]]
+        ] = []
+
+        for (
+            prev_prev_tag,
+            prev_tag,
+        ), previous_score in viterbi[i - 1].items():
+
+            for current_tag in tags:
+
+                transition = transitions.get(
+                    (
+                        prev_prev_tag,
+                        prev_tag,
+                        current_tag,
+                    ),
+                    unseen_transition_log_prob,
+                )
+
+                emission = get_emission_log_prob(
+                    word,
+                    current_tag,
+                )
+
+                score = (
+                    previous_score
+                    + transition
+                    + emission
+                )
+
+                new_state = (
+                    prev_tag,
+                    current_tag,
+                )
+
+                previous_state = (
+                    prev_prev_tag,
+                    prev_tag,
+                )
+
+                candidates.append(
+                    (
+                        score,
+                        new_state,
+                        previous_state,
+                    )
+                )
+
+        # -----------------------------------------------------
+        # Multiple previous states can lead to the same
+        # new state. Keep only the best one.
+        # -----------------------------------------------------
+
+        best_states: Dict[
+            Tuple[str, str],
+            Tuple[
+                float,
+                Tuple[str, str],
+            ],
+        ] = {}
+
+        for score, state, previous_state in candidates:
+
+            old = best_states.get(state)
+
+            if old is None or score > old[0]:
+                best_states[state] = (
+                    score,
+                    previous_state,
+                )
+
+        # -----------------------------------------------------
+        # Beam pruning
+        # -----------------------------------------------------
+
+        ranked_states = sorted(
+            best_states.items(),
+            key=lambda x: x[1][0],
+            reverse=True,
+        )
+
+        for state, (
+            score,
+            previous_state,
+        ) in ranked_states[:beam_width]:
+
+            viterbi[i][state] = score
+            backpointer[i][state] = previous_state
+
+    # ---------------------------------------------------------
+    # Termination
+    # ---------------------------------------------------------
+
     best_final_score = -float("inf")
-    best_last_tag = tags[0]
+    best_final_state = None
 
-    for t in tags:
-        end_p = end_transitions.get(t, -20.0)
-        total_score = viterbi[n - 1][t] + end_p
+    for state, score in viterbi[n - 1].items():
+
+        last_tag = state[1]
+
+        total_score = (
+            score
+            + end_transitions.get(
+                last_tag,
+                -20.0,
+            )
+        )
+
         if total_score > best_final_score:
+
             best_final_score = total_score
-            best_last_tag = t
+            best_final_state = state
 
+    if best_final_state is None:
+        return [
+            (word, tags[0])
+            for word in words
+        ]
+
+    # ---------------------------------------------------------
     # Traceback
-    predicted_tags: List[str] = [best_last_tag]
-    curr_tag = best_last_tag
-    for i in range(n - 1, 0, -1):
-        prev_tag = backpointer[i][curr_tag]
-        predicted_tags.append(prev_tag)
-        curr_tag = prev_tag
+    # ---------------------------------------------------------
 
-    predicted_tags.reverse()
+    predicted_tags: List[str] = [""] * n
+
+    state = best_final_state
+
+    predicted_tags[n - 1] = state[1]
+    predicted_tags[n - 2] = state[0]
+
+    for i in range(n - 1, 1, -1):
+
+        state = backpointer[i][state]
+
+        predicted_tags[i - 2] = state[0]
+
     return list(zip(words, predicted_tags))
 
 
@@ -295,17 +604,8 @@ def most_frequent_tag_baseline(
     words: List[str],
     training_data: List[List[Tuple[str, str]]],
 ) -> List[Tuple[str, str]]:
-    """Baseline for POS tagging: assigns the most frequent tag observed for each word in training data.
+    """Baseline: assign the most frequent tag for each word."""
 
-    If a word was never observed in training data, assigns the global majority tag.
-
-    Args:
-        words: List of word strings to tag.
-        training_data: Annotated sentences used to compute word-tag frequencies.
-
-    Returns:
-        List of (word, predicted_tag) tuples.
-    """
     if not words:
         return []
 
@@ -313,21 +613,40 @@ def most_frequent_tag_baseline(
     global_tag_counts: Counter = Counter()
 
     for sentence in training_data:
+
         for word, tag in sentence:
-            word_tag_counts[word.lower()][tag] += 1
+
+            word_tag_counts[
+                word.lower()
+            ][tag] += 1
+
             global_tag_counts[tag] += 1
 
-    # Overall most frequent tag across the corpus
-    default_tag = global_tag_counts.most_common(1)[0][0] if global_tag_counts else "NOUN"
+    default_tag = (
+        global_tag_counts.most_common(1)[0][0]
+        if global_tag_counts
+        else "NOUN"
+    )
 
-    # Precompute most frequent tag for each observed word
     word_to_mft: Dict[str, str] = {}
-    for w, counts in word_tag_counts.items():
-        word_to_mft[w] = counts.most_common(1)[0][0]
+
+    for word, counts in word_tag_counts.items():
+
+        word_to_mft[word] = (
+            counts.most_common(1)[0][0]
+        )
 
     result: List[Tuple[str, str]] = []
-    for w in words:
-        tag = word_to_mft.get(w.lower(), default_tag)
-        result.append((w, tag))
+
+    for word in words:
+
+        tag = word_to_mft.get(
+            word.lower(),
+            default_tag,
+        )
+
+        result.append(
+            (word, tag)
+        )
 
     return result
