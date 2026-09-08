@@ -9,8 +9,10 @@ import math
 import random
 import time
 from collections import Counter, defaultdict
+from typing import Optional, Tuple
 
 import nltk
+from nltk import Nonterminal, Tree
 import pandas as pd
 import streamlit as st
 
@@ -170,36 +172,16 @@ def build_delete_index(vocab):
 
 
 def method_b_candidates(word, delete_index):
-    """Return (ed1_candidates, ed2_candidates) for a misspelled word."""
     word = word.lower()
-    ed1 = set()
-    # 1. Deletion in dictionary word (Insertion in misspelled word)
-    ed1.update(delete_index.get(word, set()))
-    # 2. Deletion in misspelled word (Deletion in dict word) or Substitution
+    cands = set(delete_index.get(word, set()))
     for i in range(len(word)):
-        deleted1 = word[:i] + word[i+1:]
-        ed1.update(delete_index.get(deleted1, set()))
-        
-    # ed2: delete two chars from word, look up in index
-    ed2 = set()
-    for i in range(len(word)):
-        d1 = word[:i] + word[i+1:]
-        for j in range(len(d1)):
-            d2 = d1[:j] + d1[j+1:]
-            ed2.update(delete_index.get(d2, set()))
-            
-    ed2 -= ed1  # keep only pure ed2 candidates
-    return ed1, ed2
+        cands.update(delete_index.get(word[:i]+word[i+1:], set()))
+    return cands
 
 
-def best_candidate(word, delete_index, word_counts):
-    """Return the best spelling correction candidate, or None if word is already valid."""
-    ed1, ed2 = method_b_candidates(word, delete_index)
-    if ed1:
-        return max(ed1, key=lambda w: word_counts.get(w, 0))
-    if ed2:
-        return max(ed2, key=lambda w: word_counts.get(w, 0))
-    return None
+def best_unigram_candidate(candidates, word_counts):
+    if not candidates: return None
+    return max(candidates, key=lambda w: word_counts.get(w, 0))
 
 # ═════════════════════════════════════════════════════════
 # SECTION C — Q4: Tagset Reconciliation + PCFG + N-gram
@@ -217,21 +199,106 @@ def map_upos_to_ptb(tag):
 
 
 def train_pcfg(max_trees=500):
+    """Induces a CNF-binarized PCFG from Penn Treebank, returns (grammar, CKYParser)."""
     nltk.download("treebank", quiet=True)
     prods = []
     for tree in nltk.corpus.treebank.parsed_sents()[:max_trees]:
-        prods += tree.productions()
-    grammar = nltk.induce_pcfg(nltk.Nonterminal("S"), prods)
-    return nltk.ViterbiParser(grammar)
+        t = tree.copy(deep=True)
+        t.collapse_unary(collapsePOS=False, collapseRoot=False)
+        t.chomsky_normal_form(horzMarkov=2)
+        prods += t.productions()
+    grammar = nltk.induce_pcfg(Nonterminal("S"), prods)
+    return grammar
 
 
-def parse_with_pcfg(parser, pos_tags):
-    ptb = [map_upos_to_ptb(t) for t in pos_tags]
-    try:
-        parses = list(parser.parse(ptb))
-        if parses: return parses[0].prob(), parses[0]
-    except Exception: pass
-    return None, None
+# ─── Robust CKY parser with lexical backoff ───────────────────────────────────
+
+class _CKYParser:
+    """Viterbi CKY parser over a CNF PCFG, with POS-tag lexical backoff."""
+
+    def __init__(self, pcfg):
+        self.start = pcfg.start()
+        self.binary = defaultdict(list)   # (B,C) -> [(A, log_p)]
+        self.unary  = defaultdict(list)   # B     -> [(A, log_p)]
+        self.lexical = defaultdict(list)  # word  -> [(A, log_p)]
+        for prod in pcfg.productions():
+            lhs  = prod.lhs()
+            rhs  = prod.rhs()
+            lp   = math.log(prod.prob()) if prod.prob() > 0 else -100.0
+            if len(rhs) == 2:
+                self.binary[(rhs[0], rhs[1])].append((lhs, lp))
+            elif len(rhs) == 1:
+                if isinstance(rhs[0], Nonterminal):
+                    self.unary[rhs[0]].append((lhs, lp))
+                else:
+                    self.lexical[str(rhs[0]).lower()].append((lhs, lp))
+
+    def _unary_close(self, cell):
+        changed = True
+        for _ in range(6):
+            if not changed: break
+            changed = False
+            for b, (bs, _) in list(cell.items()):
+                for a, lp in self.unary.get(b, []):
+                    s = bs + lp
+                    if a not in cell or s > cell[a][0]:
+                        cell[a] = (s, ("U", b))
+                        changed = True
+
+    def parse(self, words, ptb_tags=None):
+        """Returns (log_prob, status) where status is 'parsed'/'partial'/'unparseable'."""
+        n = len(words)
+        if n == 0:
+            return None, "empty"
+        chart = [[{} for _ in range(n + 1)] for _ in range(n)]
+
+        # Lexical: fill length-1 cells
+        for i, w in enumerate(words):
+            cell = chart[i][i + 1]
+            for lhs, lp in self.lexical.get(w.lower(), []):
+                if lhs not in cell or lp > cell[lhs][0]:
+                    cell[lhs] = (lp, w)
+            # POS-tag backoff for OOV words
+            if ptb_tags and i < len(ptb_tags):
+                nt = Nonterminal(ptb_tags[i])
+                if nt not in cell:
+                    cell[nt] = (-12.0, w)
+            if not cell:  # absolute fallback
+                cell[Nonterminal("NN")] = (-15.0, w)
+            self._unary_close(cell)
+
+        # Binary combinations
+        for length in range(2, n + 1):
+            for i in range(n - length + 1):
+                j = i + length
+                cell = chart[i][j]
+                for k in range(i + 1, j):
+                    lc, rc = chart[i][k], chart[k][j]
+                    if not lc or not rc:
+                        continue
+                    for b, (bs, _) in lc.items():
+                        for c, (cs, _) in rc.items():
+                            for a, lp in self.binary.get((b, c), []):
+                                s = lp + bs + cs
+                                if a not in cell or s > cell[a][0]:
+                                    cell[a] = (s, (k, b, c))
+                self._unary_close(cell)
+
+        top = chart[0][n]
+        if self.start in top:
+            return top[self.start][0], "parsed"
+        if top:
+            best = max(top.keys(), key=lambda s: top[s][0])
+            return top[best][0], "partial"
+        return None, "unparseable"
+
+
+def parse_with_pcfg(pcfg_grammar, sent_words, upos_tags):
+    """Parse a sentence; returns (log_prob_or_None, status_string)."""
+    ptb_tags = [map_upos_to_ptb(t) for t in upos_tags]
+    parser = _CKYParser(pcfg_grammar)
+    log_p, status = parser.parse(sent_words, ptb_tags=ptb_tags)
+    return log_p, status
 
 
 def train_sentence_lms(sents, k=0.01):
@@ -276,28 +343,16 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
                                grammar_threshold, seg_count, spell_count, tokens_processed):
     """Process one token through Segment → Spell → Grammar checks."""
     alerts = []
-
-    # Separate alphabetic content from trailing punctuation (e.g. "project." → "project" + ".")
-    # Preserve punctuation tokens like "." so sentence-splitting works downstream.
-    stripped = token.rstrip(".,!?;:")
-    trail_punct = token[len(stripped):]
-    clean = "".join(c for c in stripped if c.isalnum()).lower()
+    clean = "".join(c for c in token if c.isalnum()).lower()
+    punct = "".join(c for c in token if not c.isalnum())
 
     # ── SEGMENT-ALERT ──────────────────────────────────────
-    # Only attempt segmentation when the token is:
-    #   (a) not in vocab, AND
-    #   (b) long enough to plausibly be two merged words (>= 8 chars)
-    # This prevents misspellings like 'hav' being fed to the segmenter.
     t0 = time.perf_counter()
     active = []
-    if clean and clean not in vocab and len(clean) >= 8:
+    if clean and (clean not in vocab or len(clean) >= 12):
         splits = viterbi_segment(clean, vocab, log_prob_fn)
-        # Accept split only if:
-        #   • at least 2 sub-words
-        #   • every sub-word is in vocab and has length >= 2 (or is 'a'/'i')
-        #   • the shortest sub-word is at least 3 chars (avoids junk splits)
         if (len(splits) >= 2
-                and all(w in vocab and (len(w) >= 3 or w in {"a", "i", "an"}) for w in splits)):
+                and all((len(w)>=2 or w in {"a","i"}) and w in vocab for w in splits)):
             alerts.append({
                 "type":"SEGMENT-ALERT", "badge":"SEGMENT",
                 "original": token,
@@ -312,14 +367,13 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
     seg_lat = (time.perf_counter()-t0)*1000
 
     # ── SPELL-ALERT ────────────────────────────────────────
-    # Skip very short tokens (1-2 chars) — they are almost always valid
-    # abbreviations or single-letter words ('a', 'i', etc.)
     t0 = time.perf_counter()
     spell_checked = []
     for t in active:
         t_clean = t.lower()
-        if t_clean and len(t_clean) >= 3 and t_clean not in vocab:
-            best = best_candidate(t_clean, delete_index, uni_counts)
+        if t_clean and t_clean not in vocab:
+            cands = method_b_candidates(t_clean, delete_index)
+            best  = best_unigram_candidate(cands, uni_counts)
             if best and best != t_clean:
                 alerts.append({
                     "type":"SPELL-ALERT","badge":"SPELL",
@@ -331,35 +385,33 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
             else:
                 spell_checked.append(t_clean)
         else:
-            spell_checked.append(t_clean if t_clean else t)
+            spell_checked.append(t_clean)
     spell_lat = (time.perf_counter()-t0)*1000
 
-    # Append corrected words; also append trailing punctuation as a separate token
-    # so that analyze_final_passage can split on '.', '!', '?', ';'
+    # Add to accumulated stream
     for tok in spell_checked:
-        if tok:  # skip empty strings
-            accumulated.append(tok)
-            tokens_processed += 1
+        accumulated.append(tok)
+        tokens_processed += 1
 
-            # ── GRAMMAR-ALERT every N tokens ──────────────────
-            if tokens_processed % trigger_n == 0:
-                t0 = time.perf_counter()
-                window_size = min(len(accumulated), trigger_n + 2)
-                window = [w for w in accumulated[-window_size:] if w.isalpha()]
-                if len(window) >= 2:
-                    avg_log_p = score_phrase_bigram(window)
-                    if avg_log_p < grammar_threshold:
-                        ppl = math.exp(-avg_log_p) if avg_log_p > -20 else 9999.0
-                        alerts.append({
-                            "type":"GRAMMAR-ALERT","badge":"GRAMMAR",
-                            "original": " ".join(window),
+        # ── GRAMMAR-ALERT every N tokens ──────────────────
+        if tokens_processed % trigger_n == 0:
+            t0 = time.perf_counter()
+            window_size = min(len(accumulated), trigger_n + 2)
+            window = [w for w in accumulated[-window_size:] if w.isalpha()]
+            if len(window) >= 2:
+                avg_log_p = score_phrase_bigram(window)
+                if avg_log_p < grammar_threshold:
+                    ppl = math.exp(-avg_log_p) if avg_log_p > -20 else 9999.0
+                    alerts.append({
+                        "type":"GRAMMAR-ALERT","badge":"GRAMMAR",
+                        "original": " ".join(window),
                         "message": f"Unusual sequence (perplexity≈{ppl:.1f}): '{ ' '.join(window)}'"
                     })
 
     return alerts, accumulated, seg_count, spell_count, tokens_processed, seg_lat, spell_lat
 
 
-def analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tri):
+def analyze_final_passage(accumulated, pos_tags, pcfg_grammar, score_bi, score_tri):
     """Split accumulated stream into sentences, score each across all 3 models."""
     rows = []
     current, cur_tags = [], []
@@ -372,27 +424,33 @@ def analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tr
 
     results = []
     for i, (sent_words, sent_tags) in enumerate(rows):
-        pcfg_prob, pcfg_tree = parse_with_pcfg(pcfg_parser, sent_tags)
+        log_p, status = parse_with_pcfg(pcfg_grammar, sent_words, sent_tags)
         bi_score  = score_bi(sent_words)
         tri_score = score_tri(sent_words)
         n = max(len(sent_words), 1)
         avg_tri = tri_score / n
 
-        if pcfg_prob is not None:
-            chosen  = "PCFG"
-            verdict = "Grammatical (PCFG parsed)"
+        if status == "parsed":
+            chosen  = "PCFG (Constituency)"
+            verdict = "Grammatical (Valid Structure)"
+            pcfg_display = f"{log_p:.2f}"
+        elif status == "partial":
+            chosen  = "PCFG (Partial)"
+            verdict = "Possibly Grammatical (Partial Parse)"
+            pcfg_display = f"{log_p:.2f} (partial)"
         elif avg_tri > -9.0:
             chosen  = "Trigram"
             verdict = "Grammatical (Trigram OK)"
+            pcfg_display = "Unparseable"
         else:
             chosen  = "Bigram/Trigram"
             verdict = "Possibly Ungrammatical"
+            pcfg_display = "Unparseable"
 
         results.append({
             "sentence_idx":  i+1,
             "sentence_text": " ".join(sent_words),
-            "pcfg_result":   f"{pcfg_prob:.2e}" if pcfg_prob else "Unparseable",
-            "pcfg_tree":     pcfg_tree,
+            "pcfg_result":   pcfg_display,
             "bigram_score":  f"{bi_score:.2f}",
             "trigram_score": f"{tri_score:.2f}",
             "chosen_method": chosen,
@@ -407,9 +465,8 @@ def analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tr
 
 @st.cache_resource(show_spinner=False)
 def load_all_models():
-    nltk.download("brown",            quiet=True)
-    nltk.download("treebank",         quiet=True)
-    nltk.download("universal_tagset", quiet=True)
+    nltk.download("brown",    quiet=True)
+    nltk.download("treebank", quiet=True)
     sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
 
     uni, bi, tri   = train_trigram_lm(sents)
@@ -484,8 +541,7 @@ with st.sidebar:
                         help="Prob of dropping space between two words (fast-typing simulation)")
     trigger_n = st.slider("Grammar Trigger Interval (N)", 3, 12, 5,
                           help="Grammar check fires every N processed words")
-    grammar_threshold = st.slider("Grammar Alert Threshold (avg log-prob/word)", -15.0, -4.0, -10.0, 0.5,
-                                    help="More negative = fewer alerts. -10 is balanced; use -7 for strict checking.")
+    grammar_threshold = st.slider("Grammar Alert Threshold (avg log-prob/word)", -15.0, -4.0, -7.5, 0.5)
     st.markdown("---")
     st.caption("**UPOS → PTB tag map:**")
     for k, v in UPOS_TO_PTB.items():
@@ -499,9 +555,8 @@ if not st.session_state.models_loaded:
     status = st.status("Loading NLP models (first run only)…", expanded=True)
     with status:
         st.write("Downloading corpora...")
-        nltk.download("brown",            quiet=True)
-        nltk.download("treebank",         quiet=True)
-        nltk.download("universal_tagset", quiet=True)
+        nltk.download("brown",    quiet=True)
+        nltk.download("treebank", quiet=True)
 
         st.write("Training Q1 Trigram LM + Viterbi…")
         sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
