@@ -474,7 +474,7 @@ def analyze_final_passage(accumulated, pos_tags, pcfg_grammar, score_bi, score_t
 def load_all_models():
     nltk.download("brown",    quiet=True)
     nltk.download("treebank", quiet=True)
-    sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
+    sents = nltk.corpus.brown.tagged_sents(tagset="universal")
 
     uni, bi, tri   = train_trigram_lm(sents)
     vocab          = set(uni.keys()) - {"<S>","</S>"}
@@ -566,7 +566,7 @@ if not st.session_state.models_loaded:
         nltk.download("treebank", quiet=True)
 
         st.write("Training Q1 Trigram LM + Viterbi…")
-        sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
+        sents = nltk.corpus.brown.tagged_sents(tagset="universal")
         uni, bi, tri = train_trigram_lm(sents)
         vocab        = set(uni.keys()) - {"<S>","</S>"}
         log_prob_fn  = make_log_prob(uni, bi, tri, len(vocab))
