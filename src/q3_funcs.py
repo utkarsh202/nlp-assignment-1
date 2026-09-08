@@ -83,6 +83,26 @@ def best_unigram_candidate(candidates, word_counts):
     return max(candidates, key=lambda word: word_counts.get(word, 0))
 
 
+def best_candidate_with_context(word, candidates, uni_counts, prev_word=None, bi_by_prev=None):
+    """Pick best non-word candidate using local bigram context if available, with prefix bonus."""
+    if not candidates:
+        return word
+
+    if prev_word and bi_by_prev:
+        prev_clean = prev_word.lower()
+        if prev_clean in bi_by_prev:
+            def score(cand):
+                bi_cnt = bi_by_prev[prev_clean].get(cand, 0)
+                uni_cnt = uni_counts.get(cand, 0)
+                # If candidate extends/shares word prefix, prioritize it as typing omission
+                prefix_bonus = 2.5 if cand.startswith(word) else 1.0
+                return (bi_cnt * 1000 + uni_cnt) * prefix_bonus
+
+            return max(candidates, key=score)
+
+    return max(candidates, key=lambda w: uni_counts.get(w, 0))
+
+
 def bigram_probability(previous, word, bigram_counts, unigram_context_counts, vocab_size):
     """Returns the add-k smoothed bigram probability P(word | previous)."""
     c_bigram  = bigram_counts[previous].get(word, 0)
@@ -97,18 +117,43 @@ def real_word_context_score(previous_word, word, next_word, bigram_counts, unigr
     return left_log_prob + right_log_prob
 
 
-def correct_real_word(word, previous_word, next_word, delete_index, bigram_counts, unigram_context_counts, vocab_size, improvement_threshold=0.5):
+def correct_real_word(word, previous_word, next_word, delete_index, bigram_counts, unigram_context_counts, vocab_size, improvement_threshold=2.5, method="B", vocab=None):
     """Correct a real-word spelling error using local bigram context."""
-    candidates = method_b_candidates(word, delete_index)
+    if method == "A" and vocab is not None:
+        candidates = method_a_candidates(word, vocab)
+    else:
+        candidates = method_b_candidates(word, delete_index)
+
     if not candidates:
+        return word
+
+    # Filter candidates: must be true edit-distance-1 (DL <= 1) and have observed bigram support
+    filtered = [
+        c for c in candidates
+        if damerau_levenshtein(word, c) <= 1
+        and (bigram_counts[previous_word].get(c, 0) > 0 or bigram_counts[c].get(next_word, 0) > 0)
+    ]
+    if not filtered:
         return word
 
     original_score = real_word_context_score(previous_word, word, next_word, bigram_counts, unigram_context_counts, vocab_size)
     best_word  = word
     best_score = original_score
 
-    for candidate in candidates:
+    COMMON_CONFUSIONS = {
+        ("meat", "meet"), ("meet", "meat"),
+        ("peace", "piece"), ("piece", "peace"),
+        ("hear", "here"), ("here", "hear"),
+        ("there", "their"), ("their", "there"),
+        ("weather", "whether"), ("whether", "weather"),
+        ("principal", "principle"), ("principle", "principal"),
+        ("loose", "lose"), ("lose", "loose"),
+    }
+
+    for candidate in filtered:
         candidate_score = real_word_context_score(previous_word, candidate, next_word, bigram_counts, unigram_context_counts, vocab_size)
+        if (word, candidate) in COMMON_CONFUSIONS:
+            candidate_score += 2.0
         if candidate_score > best_score:
             best_word  = candidate
             best_score = candidate_score

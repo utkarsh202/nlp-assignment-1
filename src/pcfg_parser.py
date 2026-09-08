@@ -1,7 +1,7 @@
 import math
 from collections import defaultdict
 import nltk
-from nltk import Nonterminal
+from nltk import Nonterminal, Tree
 
 UPOS_TO_PTB = {
     "ADJ":"JJ","ADP":"IN","ADV":"RB","AUX":"MD","CCONJ":"CC",
@@ -57,7 +57,7 @@ class _CKYParser:
                         changed = True
 
     def parse(self, words, ptb_tags=None):
-        """Returns (log_prob, status) where status is 'parsed'/'partial'/'unparseable'."""
+        """Returns (tree, log_prob, status) where status is 'parsed'/'partial'/'unparseable'."""
         n = len(words)
         chart = [[{} for _ in range(n + 1)] for _ in range(n)]
         for i, w in enumerate(words):
@@ -90,16 +90,36 @@ class _CKYParser:
                 self._unary_close(cell)
 
         top = chart[0][n]
+
+        def build_tree(sym, i, j, depth=0):
+            if depth > 40 or sym not in chart[i][j]:
+                return Tree(str(sym), ["..."])
+            score, bp = chart[i][j][sym]
+            if isinstance(bp, str):
+                return Tree(str(sym), [bp])
+            elif isinstance(bp, tuple) and bp[0] == "U":
+                _, child_sym = bp
+                return Tree(str(sym), [build_tree(child_sym, i, j, depth + 1)])
+            elif isinstance(bp, tuple) and len(bp) == 3:
+                k, left_sym, right_sym = bp
+                return Tree(str(sym), [
+                    build_tree(left_sym, i, k, depth + 1),
+                    build_tree(right_sym, k, j, depth + 1)
+                ])
+            return Tree(str(sym), [str(bp)])
+
         if self.start in top:
-            return top[self.start][0], "parsed"
+            tree = build_tree(self.start, 0, n)
+            return tree, top[self.start][0], "parsed"
         if top:
             best = max(top.keys(), key=lambda s: top[s][0])
-            return top[best][0], "partial"
-        return None, "unparseable"
+            tree = build_tree(best, 0, n)
+            return tree, top[best][0], "partial"
+        return None, None, "unparseable"
 
 def parse_with_pcfg(pcfg_grammar, sent_words, upos_tags):
-    """Parse a sentence; returns (log_prob_or_None, status_string)."""
+    """Parse a sentence; returns (tree_or_None, log_prob_or_None, status_string)."""
     ptb_tags = [map_upos_to_ptb(t) for t in upos_tags]
     parser = _CKYParser(pcfg_grammar)
-    log_p, status = parser.parse(sent_words, ptb_tags=ptb_tags)
-    return log_p, status
+    tree, log_p, status = parser.parse(sent_words, ptb_tags=ptb_tags)
+    return tree, log_p, status
