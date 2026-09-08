@@ -693,13 +693,17 @@ if mode == "Simulated Fast Typing":
         } for r in results])
         st.dataframe(df, use_container_width=True)
 
-        with st.expander("View PCFG Parse Trees"):
+        with st.expander("View PCFG Parse Details"):
             for r in results:
                 st.markdown(f"**Sent {r['sentence_idx']}:** {r['sentence_text']}")
-                if r["pcfg_tree"]:
-                    st.code(str(r["pcfg_tree"]), language="text")
+                pcfg_val = r["pcfg_result"]
+                if "Unparseable" in pcfg_val:
+                    st.caption("*(Unparseable — fell back to n-gram scoring)*")
+                elif "partial" in pcfg_val:
+                    st.caption(f"Partial parse (log-prob: {pcfg_val})")
                 else:
-                    st.caption("*(Unparseable)*")
+                    st.success(f"Full PCFG parse  |  log-prob: {pcfg_val}")
+
 
 # ═════════════════════════════════════════════════════════
 # MODE 2 — INTERACTIVE LIVE TYPING
