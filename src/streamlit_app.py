@@ -361,10 +361,11 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
             seg_count += 1
             active.extend(splits)
         else:
-            active.append(clean)
+            active.append(clean)  # segmentation tried but failed — keep as-is
     else:
-        active.append(clean if clean else token)
+        active.append(clean)
     seg_lat = (time.perf_counter()-t0)*1000
+
 
     # ── SPELL-ALERT ────────────────────────────────────────
     t0 = time.perf_counter()
@@ -388,7 +389,7 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
             spell_checked.append(t_clean)
     spell_lat = (time.perf_counter()-t0)*1000
 
-    # Add to accumulated stream
+    # Add word tokens to accumulated stream
     for tok in spell_checked:
         accumulated.append(tok)
         tokens_processed += 1
@@ -398,15 +399,21 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
             t0 = time.perf_counter()
             window_size = min(len(accumulated), trigger_n + 2)
             window = [w for w in accumulated[-window_size:] if w.isalpha()]
-            if len(window) >= 2:
-                avg_log_p = score_phrase_bigram(window)
+            if len(window) >= 3:  # need at least 3 words for a meaningful bigram
+                avg_log_p = score_phrase_bigram(window)  # already per-word avg
                 if avg_log_p < grammar_threshold:
                     ppl = math.exp(-avg_log_p) if avg_log_p > -20 else 9999.0
                     alerts.append({
                         "type":"GRAMMAR-ALERT","badge":"GRAMMAR",
                         "original": " ".join(window),
-                        "message": f"Unusual sequence (perplexity≈{ppl:.1f}): '{ ' '.join(window)}'"
+                        "message": f"Unusual sequence (perplexity≈{ppl:.1f}): '{' '.join(window)}'"
                     })
+
+    # Preserve sentence-ending punctuation as its own token so
+    # analyze_final_passage can split the passage into sentences
+    for ch in punct:
+        if ch in {".", "!", "?", ";"}:
+            accumulated.append(ch)
 
     return alerts, accumulated, seg_count, spell_count, tokens_processed, seg_lat, spell_lat
 
