@@ -407,8 +407,9 @@ def analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tr
 
 @st.cache_resource(show_spinner=False)
 def load_all_models():
-    nltk.download("brown",    quiet=True)
-    nltk.download("treebank", quiet=True)
+    nltk.download("brown",            quiet=True)
+    nltk.download("treebank",         quiet=True)
+    nltk.download("universal_tagset", quiet=True)
     sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
 
     uni, bi, tri   = train_trigram_lm(sents)
@@ -498,8 +499,9 @@ if not st.session_state.models_loaded:
     status = st.status("Loading NLP models (first run only)…", expanded=True)
     with status:
         st.write("Downloading corpora...")
-        nltk.download("brown",    quiet=True)
-        nltk.download("treebank", quiet=True)
+        nltk.download("brown",            quiet=True)
+        nltk.download("treebank",         quiet=True)
+        nltk.download("universal_tagset", quiet=True)
 
         st.write("Training Q1 Trigram LM + Viterbi…")
         sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
