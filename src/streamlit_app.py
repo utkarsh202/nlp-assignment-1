@@ -521,8 +521,11 @@ if not st.session_state.models_loaded:
     status = st.status("Loading NLP models (first run only)...", expanded=True)
     with status:
         st.write("Downloading corpora...")
+        nltk.download("universal_tagset", quiet=True)
         nltk.download("brown", quiet=True)
         nltk.download("treebank", quiet=True)
+        nltk.download("punkt", quiet=True)
+        nltk.download("punkt_tab", quiet=True)
 
         st.write("Training Q1 Trigram LM...")
         sents = nltk.corpus.brown.tagged_sents(tagset="universal")
