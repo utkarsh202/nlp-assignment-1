@@ -19,7 +19,7 @@ import streamlit as st
 # ─────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Q4 – Integrated NLP Editor",
-    page_icon="📝",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -170,16 +170,36 @@ def build_delete_index(vocab):
 
 
 def method_b_candidates(word, delete_index):
+    """Return (ed1_candidates, ed2_candidates) for a misspelled word."""
     word = word.lower()
-    cands = set(delete_index.get(word, set()))
+    ed1 = set()
+    # 1. Deletion in dictionary word (Insertion in misspelled word)
+    ed1.update(delete_index.get(word, set()))
+    # 2. Deletion in misspelled word (Deletion in dict word) or Substitution
     for i in range(len(word)):
-        cands.update(delete_index.get(word[:i]+word[i+1:], set()))
-    return cands
+        deleted1 = word[:i] + word[i+1:]
+        ed1.update(delete_index.get(deleted1, set()))
+        
+    # ed2: delete two chars from word, look up in index
+    ed2 = set()
+    for i in range(len(word)):
+        d1 = word[:i] + word[i+1:]
+        for j in range(len(d1)):
+            d2 = d1[:j] + d1[j+1:]
+            ed2.update(delete_index.get(d2, set()))
+            
+    ed2 -= ed1  # keep only pure ed2 candidates
+    return ed1, ed2
 
 
-def best_unigram_candidate(candidates, word_counts):
-    if not candidates: return None
-    return max(candidates, key=lambda w: word_counts.get(w, 0))
+def best_candidate(word, delete_index, word_counts):
+    """Return the best spelling correction candidate, or None if word is already valid."""
+    ed1, ed2 = method_b_candidates(word, delete_index)
+    if ed1:
+        return max(ed1, key=lambda w: word_counts.get(w, 0))
+    if ed2:
+        return max(ed2, key=lambda w: word_counts.get(w, 0))
+    return None
 
 # ═════════════════════════════════════════════════════════
 # SECTION C — Q4: Tagset Reconciliation + PCFG + N-gram
@@ -256,16 +276,28 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
                                grammar_threshold, seg_count, spell_count, tokens_processed):
     """Process one token through Segment → Spell → Grammar checks."""
     alerts = []
-    clean = "".join(c for c in token if c.isalnum()).lower()
-    punct = "".join(c for c in token if not c.isalnum())
+
+    # Separate alphabetic content from trailing punctuation (e.g. "project." → "project" + ".")
+    # Preserve punctuation tokens like "." so sentence-splitting works downstream.
+    stripped = token.rstrip(".,!?;:")
+    trail_punct = token[len(stripped):]
+    clean = "".join(c for c in stripped if c.isalnum()).lower()
 
     # ── SEGMENT-ALERT ──────────────────────────────────────
+    # Only attempt segmentation when the token is:
+    #   (a) not in vocab, AND
+    #   (b) long enough to plausibly be two merged words (>= 8 chars)
+    # This prevents misspellings like 'hav' being fed to the segmenter.
     t0 = time.perf_counter()
     active = []
-    if clean and (clean not in vocab or len(clean) >= 12):
+    if clean and clean not in vocab and len(clean) >= 8:
         splits = viterbi_segment(clean, vocab, log_prob_fn)
+        # Accept split only if:
+        #   • at least 2 sub-words
+        #   • every sub-word is in vocab and has length >= 2 (or is 'a'/'i')
+        #   • the shortest sub-word is at least 3 chars (avoids junk splits)
         if (len(splits) >= 2
-                and all((len(w)>=2 or w in {"a","i"}) and w in vocab for w in splits)):
+                and all(w in vocab and (len(w) >= 3 or w in {"a", "i", "an"}) for w in splits)):
             alerts.append({
                 "type":"SEGMENT-ALERT", "badge":"SEGMENT",
                 "original": token,
@@ -280,13 +312,14 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
     seg_lat = (time.perf_counter()-t0)*1000
 
     # ── SPELL-ALERT ────────────────────────────────────────
+    # Skip very short tokens (1-2 chars) — they are almost always valid
+    # abbreviations or single-letter words ('a', 'i', etc.)
     t0 = time.perf_counter()
     spell_checked = []
     for t in active:
         t_clean = t.lower()
-        if t_clean and t_clean not in vocab:
-            cands = method_b_candidates(t_clean, delete_index)
-            best  = best_unigram_candidate(cands, uni_counts)
+        if t_clean and len(t_clean) >= 3 and t_clean not in vocab:
+            best = best_candidate(t_clean, delete_index, uni_counts)
             if best and best != t_clean:
                 alerts.append({
                     "type":"SPELL-ALERT","badge":"SPELL",
@@ -298,26 +331,28 @@ def process_token_with_alerts(token, vocab, log_prob_fn, delete_index, uni_count
             else:
                 spell_checked.append(t_clean)
         else:
-            spell_checked.append(t_clean)
+            spell_checked.append(t_clean if t_clean else t)
     spell_lat = (time.perf_counter()-t0)*1000
 
-    # Add to accumulated stream
+    # Append corrected words; also append trailing punctuation as a separate token
+    # so that analyze_final_passage can split on '.', '!', '?', ';'
     for tok in spell_checked:
-        accumulated.append(tok)
-        tokens_processed += 1
+        if tok:  # skip empty strings
+            accumulated.append(tok)
+            tokens_processed += 1
 
-        # ── GRAMMAR-ALERT every N tokens ──────────────────
-        if tokens_processed % trigger_n == 0:
-            t0 = time.perf_counter()
-            window_size = min(len(accumulated), trigger_n + 2)
-            window = [w for w in accumulated[-window_size:] if w.isalpha()]
-            if len(window) >= 2:
-                avg_log_p = score_phrase_bigram(window)
-                if avg_log_p < grammar_threshold:
-                    ppl = math.exp(-avg_log_p) if avg_log_p > -20 else 9999.0
-                    alerts.append({
-                        "type":"GRAMMAR-ALERT","badge":"GRAMMAR",
-                        "original": " ".join(window),
+            # ── GRAMMAR-ALERT every N tokens ──────────────────
+            if tokens_processed % trigger_n == 0:
+                t0 = time.perf_counter()
+                window_size = min(len(accumulated), trigger_n + 2)
+                window = [w for w in accumulated[-window_size:] if w.isalpha()]
+                if len(window) >= 2:
+                    avg_log_p = score_phrase_bigram(window)
+                    if avg_log_p < grammar_threshold:
+                        ppl = math.exp(-avg_log_p) if avg_log_p > -20 else 9999.0
+                        alerts.append({
+                            "type":"GRAMMAR-ALERT","badge":"GRAMMAR",
+                            "original": " ".join(window),
                         "message": f"Unusual sequence (perplexity≈{ppl:.1f}): '{ ' '.join(window)}'"
                     })
 
@@ -345,13 +380,13 @@ def analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tr
 
         if pcfg_prob is not None:
             chosen  = "PCFG"
-            verdict = "✅ Grammatical (PCFG parsed)"
+            verdict = "Grammatical (PCFG parsed)"
         elif avg_tri > -9.0:
             chosen  = "Trigram"
-            verdict = "✅ Grammatical (Trigram OK)"
+            verdict = "Grammatical (Trigram OK)"
         else:
             chosen  = "Bigram/Trigram"
-            verdict = "❌ Possibly Ungrammatical"
+            verdict = "Possibly Ungrammatical"
 
         results.append({
             "sentence_idx":  i+1,
@@ -437,18 +472,19 @@ st.markdown('<div class="sub-header">Word Segmentation (Q1) · Spelling Correcti
 
 # ── Sidebar ───────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Settings")
     mode = st.radio("Mode", [
-        "🎬 Simulated Fast Typing",
-        "✍️ Interactive Live Typing",
-        "⚡ Speed Demon Benchmark",
+        "Simulated Fast Typing",
+        "Interactive Live Typing",
+        "Speed Demon Benchmark",
     ])
     st.markdown("---")
     merge_p = st.slider("Merge Probability (p)", 0.0, 0.25, 0.08, 0.01,
                         help="Prob of dropping space between two words (fast-typing simulation)")
     trigger_n = st.slider("Grammar Trigger Interval (N)", 3, 12, 5,
                           help="Grammar check fires every N processed words")
-    grammar_threshold = st.slider("Grammar Alert Threshold (avg log-prob/word)", -15.0, -4.0, -7.5, 0.5)
+    grammar_threshold = st.slider("Grammar Alert Threshold (avg log-prob/word)", -15.0, -4.0, -10.0, 0.5,
+                                    help="More negative = fewer alerts. -10 is balanced; use -7 for strict checking.")
     st.markdown("---")
     st.caption("**UPOS → PTB tag map:**")
     for k, v in UPOS_TO_PTB.items():
@@ -459,29 +495,29 @@ if "models_loaded" not in st.session_state:
     st.session_state.models_loaded = False
 
 if not st.session_state.models_loaded:
-    status = st.status("⏳ Loading NLP models (first run only)…", expanded=True)
+    status = st.status("Loading NLP models (first run only)…", expanded=True)
     with status:
-        st.write("📥 Downloading corpora…")
+        st.write("Downloading corpora...")
         nltk.download("brown",    quiet=True)
         nltk.download("treebank", quiet=True)
 
-        st.write("📖 Training Q1 Trigram LM + Viterbi…")
+        st.write("Training Q1 Trigram LM + Viterbi…")
         sents = nltk.corpus.brown.tagged_sents(tagset="universal")[:20000]
         uni, bi, tri = train_trigram_lm(sents)
         vocab        = set(uni.keys()) - {"<S>","</S>"}
         log_prob_fn  = make_log_prob(uni, bi, tri, len(vocab))
 
-        st.write("🏷️ Training Q1 HMM POS Tagger…")
+        st.write("Training Q1 HMM POS Tagger…")
         hmm_emit, hmm_trans, hmm_tag_cnt, hmm_tagset = train_hmm(sents)
         emit_lp, trans_lp = make_hmm_fns(hmm_emit, hmm_trans, hmm_tag_cnt, hmm_tagset)
 
-        st.write("✏️ Building Q3 Spelling Index…")
+        st.write("Building Q3 Spelling Index…")
         del_idx = build_delete_index(vocab)
 
-        st.write("📐 Training Q4 N-gram Sentence Scorers…")
+        st.write("Training Q4 N-gram Sentence Scorers…")
         score_bi, score_tri, score_phrase = train_sentence_lms(sents)
 
-        st.write("🌳 Inducing PCFG from Penn Treebank (500 trees)…")
+        st.write("Inducing PCFG from Penn Treebank (500 trees)…")
         pcfg_parser = train_pcfg(max_trees=500)
 
         st.session_state.vocab        = vocab
@@ -497,7 +533,7 @@ if not st.session_state.models_loaded:
         st.session_state.pcfg_parser  = pcfg_parser
         st.session_state.sents        = sents
         st.session_state.models_loaded = True
-        status.update(label="✅ All models loaded!", state="complete", expanded=False)
+        status.update(label="All models loaded!", state="complete", expanded=False)
 
 # Retrieve from session
 vocab        = st.session_state.vocab
@@ -517,7 +553,7 @@ st.markdown("---")
 # ═════════════════════════════════════════════════════════
 # MODE 1 — SIMULATED FAST TYPING
 # ═════════════════════════════════════════════════════════
-if mode == "🎬 Simulated Fast Typing":
+if mode == "Simulated Fast Typing":
     col_left, col_right = st.columns([1.15, 0.85])
 
     with col_left:
@@ -526,7 +562,7 @@ if mode == "🎬 Simulated Fast Typing":
         input_text = st.text_area("Passage Text:", value=SAMPLE_PASSAGES[sel], height=130)
         col_btn, col_delay = st.columns([1,1])
         with col_btn:
-            start = st.button("▶ Start Simulation", type="primary", use_container_width=True)
+            start = st.button("Start Simulation", type="primary", use_container_width=True)
         with col_delay:
             delay = st.slider("Delay (s/token):", 0.0, 0.5, 0.07, 0.01)
 
@@ -572,7 +608,7 @@ if mode == "🎬 Simulated Fast Typing":
 
             if delay > 0: time.sleep(delay)
 
-        st.success("✅ Simulation complete!")
+        st.success("Simulation complete!")
 
         # Stats
         m1,m2,m3,m4 = st.columns(4)
@@ -584,7 +620,7 @@ if mode == "🎬 Simulated Fast Typing":
 
         # Final passage analysis
         st.markdown("---")
-        st.subheader("📊 End-of-Passage Analysis (PCFG vs N-gram)")
+        st.subheader("End-of-Passage Analysis (PCFG vs N-gram)")
         with st.spinner("Tagging and parsing…"):
             pos_tags = viterbi_pos(accumulated, hmm_tagset, emit_lp, trans_lp)
             results  = analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tri)
@@ -600,7 +636,7 @@ if mode == "🎬 Simulated Fast Typing":
         } for r in results])
         st.dataframe(df, use_container_width=True)
 
-        with st.expander("🌳 View PCFG Parse Trees"):
+        with st.expander("View PCFG Parse Trees"):
             for r in results:
                 st.markdown(f"**Sent {r['sentence_idx']}:** {r['sentence_text']}")
                 if r["pcfg_tree"]:
@@ -611,7 +647,7 @@ if mode == "🎬 Simulated Fast Typing":
 # ═════════════════════════════════════════════════════════
 # MODE 2 — INTERACTIVE LIVE TYPING
 # ═════════════════════════════════════════════════════════
-elif mode == "✍️ Interactive Live Typing":
+elif mode == "Interactive Live Typing":
     st.subheader("Real-Time Interactive Editor")
     st.caption("Type text below. On every re-run the engine processes tokens incrementally.")
 
@@ -619,7 +655,7 @@ elif mode == "✍️ Interactive Live Typing":
         "Live Input:", height=120,
         placeholder="Try: I hav a good feeling about thissproject..."
     )
-    run_live = st.button("🔍 Analyse", type="primary")
+    run_live = st.button("Analyse", type="primary")
 
     if run_live and user_text.strip():
         tokens = user_text.strip().split()
@@ -653,7 +689,7 @@ elif mode == "✍️ Interactive Live Typing":
 
         # Final analysis
         st.markdown("---")
-        st.subheader("📊 Final Passage Analysis")
+        st.subheader("Final Passage Analysis")
         with st.spinner("Tagging and parsing…"):
             pos_tags = viterbi_pos(accumulated, hmm_tagset, emit_lp, trans_lp)
             results  = analyze_final_passage(accumulated, pos_tags, pcfg_parser, score_bi, score_tri)
@@ -668,14 +704,14 @@ elif mode == "✍️ Interactive Live Typing":
 # ═════════════════════════════════════════════════════════
 # MODE 3 — SPEED DEMON BENCHMARK
 # ═════════════════════════════════════════════════════════
-elif mode == "⚡ Speed Demon Benchmark":
+elif mode == "Speed Demon Benchmark":
     st.subheader("Part 5: Speed Demon Benchmark — 1,000 Words")
     st.markdown(
         "Benchmarks the latency of the **per-token layer** (Segmentation + Spelling) "
         "vs. the **grammar-trigger layer** run in isolation on exactly 1,000 simulated words."
     )
 
-    if st.button("⚡ Run Benchmark", type="primary"):
+    if st.button("Run Benchmark", type="primary"):
         random.seed(42)
         vocab_list     = [w for w in vocab if len(w) >= 4]
         batch_words    = random.sample(vocab_list, min(len(vocab_list), 1000))
