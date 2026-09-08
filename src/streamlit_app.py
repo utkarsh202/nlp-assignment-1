@@ -198,11 +198,11 @@ def map_upos_to_ptb(tag):
     return UPOS_TO_PTB.get(tag, "NN")
 
 
-def train_pcfg(max_trees=500):
+def train_pcfg():
     """Induces a CNF-binarized PCFG from Penn Treebank, returns (grammar, CKYParser)."""
     nltk.download("treebank", quiet=True)
     prods = []
-    for tree in nltk.corpus.treebank.parsed_sents()[:max_trees]:
+    for tree in nltk.corpus.treebank.parsed_sents():
         t = tree.copy(deep=True)
         t.collapse_unary(collapsePOS=False, collapseRoot=False)
         t.chomsky_normal_form(horzMarkov=2)
@@ -485,7 +485,7 @@ def load_all_models():
 
     del_idx        = build_delete_index(vocab)
     score_bi, score_tri, score_phrase = train_sentence_lms(sents)
-    pcfg_parser    = train_pcfg(max_trees=500)
+    pcfg_parser    = train_pcfg()
 
     return (vocab, log_prob_fn, uni, hmm_tagset, emit_lp, trans_lp,
             del_idx, score_bi, score_tri, score_phrase, pcfg_parser)
@@ -581,8 +581,8 @@ if not st.session_state.models_loaded:
         st.write("Training Q4 N-gram Sentence Scorers…")
         score_bi, score_tri, score_phrase = train_sentence_lms(sents)
 
-        st.write("Inducing PCFG from Penn Treebank (500 trees)…")
-        pcfg_parser = train_pcfg(max_trees=500)
+        st.write("Inducing PCFG from Penn Treebank (Full Treebank)…")
+        pcfg_parser = train_pcfg()
 
         st.session_state.vocab        = vocab
         st.session_state.log_prob_fn  = log_prob_fn
