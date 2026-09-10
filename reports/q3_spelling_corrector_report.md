@@ -86,5 +86,6 @@ All 4 test sentences from page 8 of the assignment specification were tested thr
 ---
 
 ## 5. Deployment Details
-- **Interactive Continuous Terminal CLI**: Run `uv run python src/q3_spelling_corrector/cli.py` to enter live continuous correction mode.
-- Output highlights corrections using ANSI green formatting and `**asterisks**` while reporting end-to-end latency per sentence.
+- **Interactive Continuous Terminal CLI**: Run `python3 src/cli.py` to enter live continuous correction mode.
+- Output highlights corrections using ANSI green formatting and `**asterisks**` while reporting end-to-end latency per sentence in milliseconds.
+- Supports runtime switching between Method A and Method B, and exits on `exit` or `quit`.

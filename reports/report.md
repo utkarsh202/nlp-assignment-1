@@ -86,13 +86,27 @@ where feature vector $\Phi(w)$ extracts:
 - Character prefixes of length 2 to 3 (`un-`, `re-`, `dis-`, `pre-`)
 - Orthographic shape flags: `is_capitalized`, `contains_hyphen`, `contains_digit`.
 
-## 1.5 Cross-Lingual Evaluation (English vs. Spanish)
+## 1.5 Cross-Lingual Evaluation & Comparative Analysis (English vs. Spanish)
 
-| Metric | English (Brown Corpus) | Spanish (UD GSD Treebank) | Analysis |
-|:---|:---:|:---:|:---|
-| **Segmentation Word F1** | **94.2%** | 88.6% | English benefits from a larger training split (~45,000 vs. ~14,000 sentences). Spanish verbal agglutination and enclitic clitics (`dímelo`) increase boundary ambiguity. |
-| **POS Tagging Accuracy (Standard)** | **95.8%** | 92.4% | Fixed SVO word order in English yields highly predictive tag transitions; Spanish flexible word order requires wider tag context. |
-| **Morphology Tagging Accuracy** | 91.2% | **94.7%** | Morphological agreement (Gender/Number) provides strong syntactic constraints in Spanish (e.g., *la casa blanca* enforces `DET-Fem-Sg NOUN-Fem-Sg ADJ-Fem-Sg`), outperforming English heuristic suffixes. |
+```
+====================================================================
+  BASELINE & MODEL COMPARISON SUMMARY (From Notebook Run)
+====================================================================
+Task                                    Baseline      Viterbi      Δ
+────────────────────────────────────────────────────────────────────
+English Segmentation F1                    0.713        0.907   +0.194
+Spanish Segmentation F1                    0.525        0.743   +0.218
+English POS Accuracy                       0.930        0.937   +0.008
+Spanish POS Accuracy                       0.883        0.877   -0.006
+Spanish Morphology POS Accuracy            0.853        0.836   -0.018
+====================================================================
+```
+
+### Core Comparative Insights:
+1. **Accuracy Divergence**: English and Spanish differed most in **Segmentation F1 ($\Delta = 0.164$ / 16.4%)**, driven by the 3.1x larger English training set (44,656 vs 14,187 sentences) and Spanish fusional clitics/prepositions (`despejado` $\to$ `des pe j ado`).
+2. **Agreement-Aware Tagging**: Added parameter noise ($\Delta = -0.041$), as expanding from 16 to 54 tags caused transition parameters to explode ($54^3 = 157,464$) leading to severe data sparsity.
+3. **Error Attribution**: **62.91%** of pipeline errors were segmentation-induced (134 errors), while only **37.09%** were genuine POS errors (79 errors), showing segmentation is the primary pipeline bottleneck.
+4. **Baseline Superiority**: Viterbi LM segmentation dramatically outperformed greedy longest-match by **+19.4% F1** in English and **+21.8% F1** in Spanish.
 
 ---
 
